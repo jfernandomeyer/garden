@@ -49,23 +49,28 @@ export const cleanupClusterRegistry: PluginCommand = {
       })
     }
 
-    // Clean old directories from build sync volume
-    await cleanupBuildSyncVolume(provider, log)
-
     // Scan through all Pods in cluster
     const api = await KubeApi.factory(log, provider)
     const imagesInUse = await getImagesInUse(api, provider, log)
 
     // Get images in registry
     if (provider.config.deploymentRegistry?.hostname === inClusterRegistryHostname) {
-      const images = await getImagesInRegistry(k8sCtx, log)
+      try {
+        const images = await getImagesInRegistry(k8sCtx, log)
 
-      // Delete images no longer in use
-      const diff = difference(images, imagesInUse)
-      await deleteImagesFromRegistry(k8sCtx, log, diff)
+        // Delete images no longer in use
+        const diff = difference(images, imagesInUse)
+        await deleteImagesFromRegistry(k8sCtx, log, diff)
 
-      // Run garbage collection
-      await runRegistryGarbageCollection(k8sCtx, api, log)
+        // Run garbage collection
+        await runRegistryGarbageCollection(k8sCtx, api, log)
+      } catch (error) {
+        // Catch this and continue, so that other steps may be completed
+        log.error({
+          msg: `Failed cleaning images from in-cluster registry: ${error}\n\nSee error.log for details`,
+          error,
+        })
+      }
     } else {
       log.info("Not using in-cluster registry, skipping registry cleanup.")
     }
@@ -73,6 +78,9 @@ export const cleanupClusterRegistry: PluginCommand = {
     if (provider.config.buildMode === "cluster-docker") {
       await deleteImagesFromDaemon(provider, log, imagesInUse)
     }
+
+    // Clean old directories from build sync volume
+    await cleanupBuildSyncVolume(provider, log)
 
     log.info({ msg: chalk.green("\nDone!"), status: "success" })
 
@@ -130,7 +138,8 @@ async function getImagesInRegistry(ctx: KubernetesPluginContext, log: LogEntry) 
 
   while (nextUrl) {
     const res = await queryRegistry(ctx, log, nextUrl)
-    repositories.push(...res.body.repositories)
+    const body = JSON.parse(res.body)
+    repositories.push(...body.repositories)
 
     // Paginate
     const linkHeader = <string | undefined>res.headers["Link"]
@@ -148,8 +157,9 @@ async function getImagesInRegistry(ctx: KubernetesPluginContext, log: LogEntry) 
 
     while (nextUrl) {
       const res = await queryRegistry(ctx, log, nextUrl)
-      if (res.body.tags) {
-        images.push(...res.body.tags.map((tag: string) => `${repo}:${tag}`))
+      const body = JSON.parse(res.body)
+      if (body.tags) {
+        images.push(...body.tags.map((tag: string) => `${repo}:${tag}`))
       }
       // Paginate
       const linkHeader = <string | undefined>res.headers["link"]
@@ -190,7 +200,7 @@ async function deleteImagesFromRegistry(ctx: KubernetesPluginContext, log: LogEn
         method: "DELETE",
       })
     } catch (err) {
-      if (err.response && err.response.status !== 404) {
+      if (err.response?.statusCode !== 404) {
         throw err
       }
     }
